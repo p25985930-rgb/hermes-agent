@@ -6597,6 +6597,33 @@ def call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    # ── PATH Y: thread the LLM request middleware into the auxiliary client.
+    # This makes auxiliary LLM calls (compression, vision, web_extract, MoA
+    # advisors, etc.) honour the same routing/circuit-breaker seam as the main
+    # conversation loop. The middleware is a no-op when no middleware is
+    # registered (apply_llm_request_middleware returns the request unchanged),
+    # so this is purely additive. ``user_pinned_model`` is True when the caller
+    # passed an explicit model/provider (i.e. a deliberate pin), which tells the
+    # middleware to skip routing and preserve the requested model/provider.
+    try:
+        from hermes_cli.middleware import apply_llm_request_middleware
+
+        _aux_user_pinned = bool(model) or bool(provider)
+        _aux_mw = apply_llm_request_middleware(
+            kwargs,
+            task_id=task or "aux",
+            session_id="",
+            platform="",
+            model=final_model,
+            provider=resolved_provider,
+            base_url=_client_base or resolved_base_url,
+            api_mode=resolved_api_mode,
+            user_pinned_model=_aux_user_pinned,
+        )
+        kwargs = _aux_mw.payload
+    except Exception:
+        pass
+
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
     # _validate_llm_response and the temperature/max_tokens/payment fallback chain
@@ -7198,6 +7225,27 @@ async def async_call_llm(
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # ── PATH Y: thread the LLM request middleware into the async auxiliary
+    # client (mirror of call_llm). No-op when no middleware is registered.
+    try:
+        from hermes_cli.middleware import apply_llm_request_middleware
+
+        _aux_user_pinned = bool(model) or bool(provider)
+        _aux_mw = apply_llm_request_middleware(
+            kwargs,
+            task_id=task or "aux",
+            session_id="",
+            platform="",
+            model=final_model,
+            provider=resolved_provider,
+            base_url=_client_base or resolved_base_url,
+            api_mode=resolved_api_mode,
+            user_pinned_model=_aux_user_pinned,
+        )
+        kwargs = _aux_mw.payload
+    except Exception:
+        pass
 
     try:
         # Retry ONCE on the same provider for a transient transport blip

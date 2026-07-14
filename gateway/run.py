@@ -13517,6 +13517,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                # ── PATH Y: record whether this agent was built with an
+                # explicit user-pinned model (/model override). Purely additive.
+                try:
+                    agent.model_pinned = bool(
+                        self._session_model_overrides.get(session_key)
+                    )
+                except Exception:
+                    agent.model_pinned = False
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -18504,6 +18512,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                # ── PATH Y: record whether this agent was built with an
+                # explicit user-pinned model (/model override). conversation_loop
+                # reads this to tell the routing middleware to bypass routing.
+                # Purely additive: absent override -> False (routing unchanged).
+                try:
+                    agent.model_pinned = bool(
+                        self._session_model_overrides.get(session_key)
+                    )
+                except Exception:
+                    agent.model_pinned = False
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for
