@@ -6617,12 +6617,45 @@ def _strip_model_resolution_injections(
     ``chat.model``, ``agent.model``, ``delegation.model``,
     ``auxiliary.compression.model``/``timeout``) at load time so runtime
     readers observe inherited values. Those are runtime-only — they must never
-    be written to disk unless the user explicitly set them. Pop each key when
-    its dotted path was NOT among the user's explicit raw config paths,
-    leaving user-authored values untouched.
+    be written to disk unless the user explicitly set them.
+
+    A key whose dotted path was among the user's explicit raw config paths is
+    always preserved (``path in preserve`` → skip). For every other key, the
+    value is removed ONLY when it still equals the runtime-injected default
+    that ``_resolve_model_consistency`` wrote at load time. If the value was
+    changed in memory after load (e.g. an explicit ``_save_aux_choice``
+    mutation) it no longer matches the injected default and is preserved, so
+    the user's in-memory selection is not silently discarded.
     """
+    # No resolution ran -> nothing was injected -> nothing to strip. This also
+    # guards auxiliary.compression.timeout, which is only injected alongside
+    # the canonical-model injection below.
+    model_section = config.get("model") if isinstance(config.get("model"), dict) else {}
+    canonical = (model_section.get("default") or "").strip()
+    if not canonical:
+        return config
+
+    compression_default = (
+        (config.get("compression") or {}).get("default_model") or ""
+    ).strip()
+    aux_default_model = compression_default or canonical
+
+    # The exact value each path receives when _resolve_model_consistency injects
+    # it. Keys not in this map are never stripped.
+    _INJECTED_DEFAULT: Dict[Tuple[str, ...], Any] = {
+        ("worker_model",): canonical,
+        ("delegation", "model"): canonical,
+        ("chat", "model"): canonical,
+        ("agent", "model"): canonical,
+        ("auxiliary", "compression", "model"): aux_default_model,
+        ("auxiliary", "compression", "timeout"): 120,
+    }
+
     for path in _MODEL_RESOLUTION_KEYS:
         if path in preserve:
+            continue
+        injected = _INJECTED_DEFAULT.get(path)
+        if injected is None:
             continue
         node = config
         ok = True
@@ -6631,7 +6664,10 @@ def _strip_model_resolution_injections(
                 ok = False
                 break
             node = node[key]
-        if ok and isinstance(node, dict) and path[-1] in node:
+        if not ok or not isinstance(node, dict) or path[-1] not in node:
+            continue
+        # Strip only when the value is still the runtime-injected default.
+        if node[path[-1]] == injected:
             del node[path[-1]]
     return config
 
