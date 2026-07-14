@@ -6593,6 +6593,213 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+# Keys that ``_resolve_model_consistency`` may inject into the *in-memory*
+# loaded config so runtime readers see inherited models. These are strictly
+# runtime-only: ``_strip_model_resolution_injections`` removes them again
+# before ``save_config`` persists anything, so they never pollute config.yaml
+# unless the user explicitly authored them.
+_MODEL_RESOLUTION_KEYS = (
+    ("worker_model",),
+    ("delegation", "model"),
+    ("chat", "model"),
+    ("agent", "model"),
+    ("auxiliary", "compression", "model"),
+    ("auxiliary", "compression", "timeout"),
+)
+
+
+def _strip_model_resolution_injections(
+    config: Dict[str, Any], preserve: Set[Tuple[str, ...]]
+) -> Dict[str, Any]:
+    """Drop shim-injected model-inheritance keys before persisting.
+
+    ``_resolve_model_consistency`` fills subsystem model keys (``worker_model``,
+    ``chat.model``, ``agent.model``, ``delegation.model``,
+    ``auxiliary.compression.model``/``timeout``) at load time so runtime
+    readers observe inherited values. Those are runtime-only — they must never
+    be written to disk unless the user explicitly set them. Pop each key when
+    its dotted path was NOT among the user's explicit raw config paths,
+    leaving user-authored values untouched.
+    """
+    for path in _MODEL_RESOLUTION_KEYS:
+        if path in preserve:
+            continue
+        node = config
+        ok = True
+        for key in path[:-1]:
+            if not isinstance(node, dict) or key not in node:
+                ok = False
+                break
+            node = node[key]
+        if ok and isinstance(node, dict) and path[-1] in node:
+            del node[path[-1]]
+    return config
+
+
+def _resolve_model_consistency(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Single source-of-truth shim for model selection (v1.2, Option B).
+
+    ``model.default`` is the canonical chat/agent model (see
+    ``_normalize_root_model_keys``). Several independent config keys used to
+    select models for *other* subsystems used to fall back through their own
+    hardcoded defaults, so editing ``model.default`` silently failed to
+    propagate. This makes every empty subsystem key inherit the canonical
+    model at load time, while NEVER overwriting an explicitly configured value.
+
+    Inheritance rules (empty target -> inherit canonical ``model.default``):
+      * ``worker_model``                       (top-level scalar)
+      * ``delegation.model``                  (delegation.* dict)
+      * ``chat.model``                        (chat.* dict)
+      * ``agent.model``                       (agent.* dict)
+      * ``auxiliary.compression.model``       -> ``compression.default_model``
+                                                (itself defaults to model.default)
+
+    Explicit values always win: if a subsystem key is already non-empty it is
+    left untouched. When an explicit value *conflicts* with the canonical model
+    (differs from ``model.default``) we only WARN — we never change it — so
+    existing configurations keep behaving identically.
+
+    The function also emits structured startup diagnostics (canonical + each
+    resolved subsystem model + compression provider/endpoint/timeout). These go
+    through the module logger at INFO/WARNING; with no configured handler
+    (e.g. test runs) they are dropped, so callers that assert on logs are
+    unaffected.
+
+    Pure/in-memory only: this mutates the already-loaded config dict and never
+    writes back to disk, so user config files are left untouched.
+    """
+    model_section = config.get("model") if isinstance(config.get("model"), dict) else {}
+    canonical = (model_section.get("default") or "").strip()
+
+    # Runtime-only guarantee: when ``model.default`` is unset there is nothing
+    # to inherit, so leave the config completely untouched. This keeps
+    # ``save_config(load_config())`` idempotent (no empty sections/keys
+    # materialised) and avoids turning an inherited value into a sticky
+    # explicit one that would freeze future ``model.default`` edits.
+    if not canonical:
+        return config
+
+    def _inherit(key_path: list, current_value: Any) -> Any:
+        """Return ``current_value`` if explicitly set, else ``canonical``."""
+        if isinstance(current_value, str) and current_value.strip():
+            _val = current_value.strip()
+            # Routing directives (auto/best-*) are intentional, never conflicts.
+            _is_routing = _val.startswith("auto/") or _val.startswith("best-")
+            if canonical and _val != canonical and not _is_routing:
+                logger.warning(
+                    "[model-resolution] explicit %s=%r differs from canonical "
+                    "model.default=%r; keeping explicit value (set model.default "
+                    "to unify, or clear this key to inherit).",
+                    ".".join(key_path), _val, canonical,
+                )
+            return current_value
+        return canonical
+
+    # worker_model (top-level scalar)
+    config["worker_model"] = _inherit(
+        ["worker_model"], config.get("worker_model")
+    )
+
+    # delegation.model
+    delegation = config.setdefault("delegation", {})
+    if not isinstance(delegation, dict):
+        delegation = config["delegation"] = {}
+    delegation["model"] = _inherit(
+        ["delegation", "model"], delegation.get("model")
+    )
+
+    # chat.model
+    chat = config.setdefault("chat", {})
+    if not isinstance(chat, dict):
+        chat = config["chat"] = {}
+    chat["model"] = _inherit(["chat", "model"], chat.get("model"))
+
+    # agent.model
+    agent = config.setdefault("agent", {})
+    if not isinstance(agent, dict):
+        agent = config["agent"] = {}
+    agent["model"] = _inherit(["agent", "model"], agent.get("model"))
+
+    # auxiliary.compression.model -> compression.default_model -> canonical
+    compression_default = (
+        (config.get("compression") or {}).get("default_model") or ""
+    ).strip()
+    aux_default_model = compression_default or canonical
+    aux = config.setdefault("auxiliary", {})
+    if not isinstance(aux, dict):
+        aux = config["auxiliary"] = {}
+    comp = aux.setdefault("compression", {})
+    if not isinstance(comp, dict):
+        comp = aux["compression"] = {}
+    # Compression resolves to the configurable compression default (NOT the
+    # chat canonical), falling back to canonical only if that default is unset.
+    comp_resolved = (
+        (comp.get("model") or "").strip()
+        or compression_default
+        or canonical
+    )
+    if comp.get("model") and str(comp.get("model")).strip():
+        # Explicit compression model present: keep it, warn only on conflict.
+        if (canonical and comp_resolved != canonical
+                and not comp_resolved.startswith(("auto/", "best-"))):
+            logger.warning(
+                "[model-resolution] explicit auxiliary.compression.model=%r "
+                "differs from canonical model.default=%r; keeping explicit value.",
+                comp_resolved, canonical,
+            )
+    comp["model"] = comp_resolved
+    # Ensure a sane timeout default so compression does not rely on a hidden
+    # value; explicit config still wins (we only set when absent/zero).
+    try:
+        _to = float(comp.get("timeout")) if comp.get("timeout") not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        _to = 0.0
+    if _to <= 0:
+        comp["timeout"] = 120
+
+    _emit_model_diagnostics(config, canonical, chat, agent, delegation, comp)
+    return config
+
+
+def _emit_model_diagnostics(
+    config: Dict[str, Any],
+    canonical: str,
+    chat: Dict[str, Any],
+    agent: Dict[str, Any],
+    delegation: Dict[str, Any],
+    comp: Dict[str, Any],
+) -> None:
+    """Log structured startup diagnostics for model resolution.
+
+    No-op effect on execution; purely observability. Emitted at INFO (and the
+    conflict note at WARNING inside ``_resolve_model_consistency``).
+    """
+    aux = config.get("auxiliary") or {}
+    comp_full = aux.get("compression") or comp
+    provider = (comp_full.get("provider") or "auto").strip() or "auto"
+    base_url = (comp_full.get("base_url") or "").strip()
+    endpoint = base_url or "auto-resolved (main runtime)"
+    timeout = comp_full.get("timeout", 120)
+    resolved_comp_model = comp_full.get("model") or canonical or "(none)"
+    logger.info(
+        "[model-resolution] Canonical model: %s\n"
+        "  Resolved chat model:        %s\n"
+        "  Resolved agent model:       %s\n"
+        "  Resolved delegation model:  %s\n"
+        "  Resolved worker model:      %s\n"
+        "  Resolved compression model: %s (provider=%s, timeout=%ss, endpoint=%s)",
+        canonical or "(none)",
+        chat.get("model") or canonical or "(none)",
+        agent.get("model") or canonical or "(none)",
+        delegation.get("model") or canonical or "(none)",
+        config.get("worker_model") or canonical or "(none)",
+        resolved_comp_model,
+        provider,
+        timeout,
+        endpoint,
+    )
+
+
 def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize legacy root-level max_turns into agent.max_turns.
 
@@ -7022,7 +7229,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        normalized = _resolve_model_consistency(
+            _normalize_root_model_keys(_normalize_max_turns_config(config))
+        )
         expanded = _expand_env_vars(normalized)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
@@ -7215,6 +7424,15 @@ def save_config(
                 DEFAULT_CONFIG,
                 preserve_keys=effective_preserve_keys,
             )
+
+        # Strip runtime-only model-inheritance keys injected by
+        # _resolve_model_consistency at load time. These are NOT user values
+        # (unless their dotted path appears in effective_preserve_keys, i.e. the
+        # user explicitly set them) and must never be persisted - see
+        # _strip_model_resolution_injections. Runs after _strip_default_values
+        # so we never keep a shim-injected default that _strip_default_values
+        # would also drop.
+        normalized = _strip_model_resolution_injections(normalized, effective_preserve_keys)
 
         # Build optional commented-out sections for features that are off by
         # default or only relevant when explicitly configured.
